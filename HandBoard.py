@@ -24,8 +24,8 @@ options = HandLandmarkerOptions(
     base_options=BaseOptions(model_asset_path="hand_landmarker.task"),
     running_mode=VisionRunningMode.VIDEO,
     num_hands=2,
-    min_hand_detection_confidence=0.3,
-    min_tracking_confidence=0.3
+    min_hand_detection_confidence=0.4,
+    min_tracking_confidence=0.4
 )
 
 # ── Camera ────────────────────────────────────────────────
@@ -45,6 +45,75 @@ frame      = cv2.flip(frame, 1)
 H, W       = frame.shape[:2]
 
 canvas = np.zeros((H, W, 4), dtype=np.uint8)
+
+# Shape objects — list of dicts
+shapes        = []   # [{type, color, thickness, data}]
+selected_idx  = -1   # index shape yang dipilih
+drag_offset   = (0, 0)
+drag_start    = None
+
+def redraw_canvas():
+    """Gambar ulang semua shape ke canvas"""
+    global canvas
+    canvas = np.zeros((H, W, 4), dtype=np.uint8)
+    for i, s in enumerate(shapes):
+        col = s["color"]
+        t   = s["thickness"]
+        if s["type"] == "rect":
+            x1, y1, x2, y2 = s["data"]
+            cv2.rectangle(canvas, (x1,y1), (x2,y2), col, t)
+        elif s["type"] == "circle":
+            cx, cy, r = s["data"]
+            cv2.circle(canvas, (cx,cy), r, col, t)
+        elif s["type"] == "line":
+            pts = s["data"]
+            for j in range(1, len(pts)):
+                p1 = pts[j-1]
+                p2 = pts[j]
+                d     = dist_pts(p1[0], p1[1], p2[0], p2[1])
+                steps = max(1, d // 2)
+                for s_i in range(steps + 1):
+                    t_i = s_i / steps
+                    mx  = int(p1[0] + (p2[0] - p1[0]) * t_i)
+                    my  = int(p1[1] + (p2[1] - p1[1]) * t_i)
+                    cv2.circle(canvas, (mx, my), t, col, -1)
+
+def point_near_shape(px, py, s, threshold=40):
+    """Cek apakah titik (px,py) dekat dengan shape s"""
+    if s["type"] == "rect":
+        x1, y1, x2, y2 = s["data"]
+        # Cek dekat dengan tepi kotak
+        cx = (x1+x2)//2
+        cy = (y1+y2)//2
+        inside = x1 <= px <= x2 and y1 <= py <= y2
+        near_edge = (abs(px-x1) < threshold or abs(px-x2) < threshold or
+                     abs(py-y1) < threshold or abs(py-y2) < threshold)
+        return inside or near_edge
+    elif s["type"] == "circle":
+        cx, cy, r = s["data"]
+        d = dist_pts(px, py, cx, cy)
+        return abs(d - r) < threshold or d < threshold
+    elif s["type"] == "line":
+        pts = s["data"]
+        if not pts:
+            return False
+        # Cek jarak ke titik terdekat di garis
+        for pt in pts:
+            if dist_pts(px, py, pt[0], pt[1]) < threshold:
+                return True
+    return False
+
+def move_shape(idx, dx, dy):
+    """Pindahkan shape idx sejauh (dx, dy)"""
+    s = shapes[idx]
+    if s["type"] == "rect":
+        x1, y1, x2, y2 = s["data"]
+        s["data"] = (x1+dx, y1+dy, x2+dx, y2+dy)
+    elif s["type"] == "circle":
+        cx, cy, r = s["data"]
+        s["data"] = (cx+dx, cy+dy, r)
+    elif s["type"] == "line":
+        s["data"] = [(x+dx, y+dy) for x,y in s["data"]]
 
 # ── Colors ────────────────────────────────────────────────
 COLORS = [
@@ -80,6 +149,8 @@ shape_last_commit = 0
 SHAPE_MIN_HOLD    = 0.3
 SHAPE_DEBOUNCE    = 0.5
 MIN_SHAPE_SIZE    = 20
+DRAW_COOLDOWN     = 0.8   # detik tidak bisa draw setelah shape selesai
+last_shape_time   = 0     # waktu terakhir shape di-commit
 
 # Two finger rect state
 two_finger_rect_start  = 0
@@ -90,6 +161,11 @@ two_finger_p1          = None
 two_finger_p2          = None
 TIPS_CLOSE             = 60
 
+drag_active   = False
+drag_idx      = -1
+drag_prev_x   = None
+drag_prev_y   = None
+
 # Stabilitas tangan
 STABLE_FRAMES    = 10
 STABLE_THRESHOLD = 0.015
@@ -97,15 +173,24 @@ hand_pos_history = []
 hand_is_stable   = False
 
 # Smoothing
-SMOOTH_N = 1
+SMOOTH_N = 3
 smooth_x = []
 smooth_y = []
 
-# Frame skip — proses MediaPipe setiap N frame
-PROCESS_EVERY = 3
-frame_count   = 0
+# Frame skip
+PROCESS_EVERY  = 2
+frame_count    = 0
 last_detection = None
 
+# Pre-compute LUT untuk koreksi warna kamera
+def make_lut(alpha, beta):
+    lut = np.arange(256, dtype=np.float32)
+    lut = np.clip(lut * alpha + beta, 0, 255).astype(np.uint8)
+    return lut
+
+#lut_bright = make_lut(1.8, 20)
+
+# ── Helper functions ──────────────────────────────────────
 def smooth_point(x, y):
     smooth_x.append(x)
     smooth_y.append(y)
@@ -127,6 +212,9 @@ def hand_facing_down(lm):
     if len(lm) < 21:
         return False
     return lm[12].y > lm[0].y
+def is_four_fingers(up):
+    """4 jari terangkat, jempol menekuk"""
+    return (not up[0] and up[1] and up[2] and up[3] and up[4])
 
 def fingers_up(lm):
     if len(lm) < 21:
@@ -145,16 +233,9 @@ def fingers_up(lm):
             up.append(lm[tip].y < lm[joint].y)
     return up
 
-def finger_len(lm, tip, mcp):
-    dx = lm[tip].x - lm[mcp].x
-    dy = lm[tip].y - lm[mcp].y
-    return (dx**2 + dy**2) ** 0.5
-
 def update_stability(lm):
     global hand_is_stable
-    wx = lm[0].x
-    wy = lm[0].y
-    hand_pos_history.append((wx, wy))
+    hand_pos_history.append((lm[0].x, lm[0].y))
     if len(hand_pos_history) > STABLE_FRAMES:
         hand_pos_history.pop(0)
     if len(hand_pos_history) < STABLE_FRAMES:
@@ -234,22 +315,37 @@ def get_shape_anchor(lm):
     return ax, ay
 
 def commit_rect(p1, p2):
+    global last_shape_time
     if abs(p2[0]-p1[0]) < MIN_SHAPE_SIZE or abs(p2[1]-p1[1]) < MIN_SHAPE_SIZE:
         return False
     col       = COLORS[color_idx][1]
     thickness = SIZES[size_idx]
-    cv2.rectangle(canvas, p1, p2, col, thickness)
+    shapes.append({
+        "type": "rect",
+        "color": col,
+        "thickness": thickness,
+        "data": (p1[0], p1[1], p2[0], p2[1])
+    })
+    redraw_canvas()
+    last_shape_time = time.time()
     return True
 
 def commit_circle(sx, sy, cx, cy):
-    global shape_last_commit
+    global shape_last_commit, last_shape_time
     r = dist_pts(sx, sy, cx, cy)
     if r < MIN_SHAPE_SIZE:
         return False
     col       = COLORS[color_idx][1]
     thickness = SIZES[size_idx]
-    cv2.circle(canvas, (sx, sy), r, col, thickness)
+    shapes.append({
+        "type": "circle",
+        "color": col,
+        "thickness": thickness,
+        "data": (sx, sy, r)
+    })
+    redraw_canvas()
     shape_last_commit = time.time()
+    last_shape_time   = time.time()
     return True
 
 def apply_glow(canvas, color_bgra, radius=12):
@@ -346,18 +442,12 @@ with HandLandmarker.create_from_options(options) as landmarker:
         now   = time.time()
         frame_count += 1
 
-        # Koreksi warna agar lebih vivid seperti ffplay
-        frame = cv2.convertScaleAbs(frame, alpha=1.2, beta=10)
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        frame[:, :, 1] = cv2.convertScaleAbs(frame[:, :, 1], alpha=1.5)
-        frame = cv2.cvtColor(frame, cv2.COLOR_HSV2BGR)
-
-        # Proses MediaPipe setiap N frame — kurangi beban CPU
+        # Proses MediaPipe setiap N frame
         if frame_count % PROCESS_EVERY == 0:
-            small        = cv2.resize(frame, (640, 360))
-            rgb          = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-            mp_image     = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int(time.time() * 1000)
+            small          = cv2.resize(frame, (640, 360))
+            rgb            = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            mp_image       = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp_ms   = int(time.time() * 1000)
             last_detection = landmarker.detect_for_video(mp_image, timestamp_ms)
 
         detection  = last_detection
@@ -439,6 +529,12 @@ with HandLandmarker.create_from_options(options) as landmarker:
             two_finger_p2        = None
 
             if hand_count == 0:
+
+                drag_active = False
+                drag_idx    = -1
+                drag_prev_x = None
+                drag_prev_y = None
+
                 hand_pos_history.clear()
                 hand_is_stable   = False
                 shape_mode       = None
@@ -470,6 +566,7 @@ with HandLandmarker.create_from_options(options) as landmarker:
                         fist_triggered  = False
                     if now - fist_start_time >= 1.0 and not fist_triggered:
                         canvas         = np.zeros((H, W, 4), dtype=np.uint8)
+                        shapes.clear()
                         fist_triggered = True
                         set_notif("Canvas cleared")
                     kx = int(lm[9].x * W)
@@ -489,9 +586,43 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     tips_y = [lm[8].y, lm[12].y, lm[16].y]
                     cx_e   = int(sum(tips_x) / 3 * W)
                     cy_e   = int(sum(tips_y) / 3 * H)
-                    cv2.circle(canvas, (cx_e, cy_e), 40, (0,0,0,0), -1)
-                    cv2.circle(frame,  (cx_e, cy_e), 40, (255,255,255), 2)
-                    cv2.circle(frame,  (cx_e, cy_e), 3,  (255,255,255), -1)
+
+                    eraser_r     = 40
+                    need_redraw  = False
+                    to_remove    = []
+
+                    for i, s in enumerate(shapes):
+                        if s["type"] == "line":
+                            # Hapus titik per-titik yang tersentuh eraser
+                            before = len(s["data"])
+                            s["data"] = [
+                                pt for pt in s["data"]
+                                if dist_pts(cx_e, cy_e, pt[0], pt[1]) > eraser_r
+                            ]
+                            if len(s["data"]) != before:
+                                need_redraw = True
+                            # Hapus shape jika sudah kosong
+                            if len(s["data"]) == 0:
+                                to_remove.append(i)
+
+                        elif s["type"] in ("rect", "circle"):
+                            # Rect dan circle tetap hapus seluruh shape
+                            if point_near_shape(cx_e, cy_e, s, threshold=eraser_r):
+                                to_remove.append(i)
+                                need_redraw = True
+
+                    # Hapus shape kosong dari belakang
+                    for i in reversed(to_remove):
+                        shapes.pop(i)
+
+                    if need_redraw:
+                        redraw_canvas()
+                    else:
+                        # Tidak ada shape kena — hapus pixel canvas langsung
+                        cv2.circle(canvas, (cx_e, cy_e), eraser_r, (0,0,0,0), -1)
+
+                    cv2.circle(frame, (cx_e, cy_e), eraser_r, (255,255,255), 2)
+                    cv2.circle(frame, (cx_e, cy_e), 3,        (255,255,255), -1)
 
                 elif is_pinky_only(lm):
                     shape_mode     = None
@@ -512,6 +643,52 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     nc = COLORS[(color_idx + 1) % len(COLORS)][1][:3]
                     cv2.circle(frame, (px, py), 10, nc, -1)
                     cv2.circle(frame, (px, py), 12, (255,255,255), 1)
+
+                # ── 4 jari: move shape (hanya jika ada shapes) ──
+                elif is_four_fingers(up) and len(shapes) > 0:
+                    fist_start_time  = 0
+                    fist_triggered   = False
+                    pinky_start_time = 0
+                    pinky_triggered  = False
+                    prev_x, prev_y   = None, None
+                    smooth_x.clear()
+                    smooth_y.clear()
+                    mode = "move"
+
+                    mx = int((lm[8].x+lm[12].x+lm[16].x+lm[20].x)/4 * W)
+                    my = int((lm[8].y+lm[12].y+lm[16].y+lm[20].y)/4 * H)
+
+                    if not drag_active:
+                        for i, s in enumerate(shapes):
+                            # Hanya select rect dan circle, bukan line
+                            if s["type"] in ("rect", "circle") and \
+                               point_near_shape(mx, my, s):
+                                drag_active = True
+                                drag_idx    = i
+                                drag_prev_x = mx
+                                drag_prev_y = my
+                                set_notif("Shape selected!")
+                                break
+
+                    if drag_active and drag_idx >= 0:
+                        if drag_prev_x is not None:
+                            dx = mx - drag_prev_x
+                            dy = my - drag_prev_y
+                            move_shape(drag_idx, dx, dy)
+                            redraw_canvas()
+                        drag_prev_x = mx
+                        drag_prev_y = my
+
+                        s = shapes[drag_idx]
+                        if s["type"] == "rect":
+                            x1,y1,x2,y2 = s["data"]
+                            cv2.rectangle(frame, (x1,y1), (x2,y2),
+                                          (0,255,255), 2)
+                        elif s["type"] == "circle":
+                            cx,cy,r = s["data"]
+                            cv2.circle(frame, (cx,cy), r, (0,255,255), 2)
+
+                    cv2.circle(frame, (mx, my), 12, (0,255,255), 2)
 
                 elif is_circle_gesture(lm, up):
                     fist_start_time  = 0
@@ -538,6 +715,14 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     cv2.circle(frame, (ax, ay), 8, COLORS[color_idx][1][:3], -1)
 
                 else:
+
+                    # Reset drag saat gesture dilepas
+                    if drag_active:
+                        drag_active = False
+                        drag_idx    = -1
+                        drag_prev_x = None
+                        drag_prev_y = None
+
                     if shape_mode is not None and shape_start is not None:
                         if now - shape_start_time >= SHAPE_MIN_HOLD:
                             if now - shape_last_commit >= SHAPE_DEBOUNCE:
@@ -552,16 +737,70 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     pinky_start_time = 0
                     pinky_triggered  = False
 
-                    if up[1] and not up[2] and not up[3] and not up[4]:
+                    if up[1] and not up[2] and not up[3] and not up[4] and \
+                       now - last_shape_time > DRAW_COOLDOWN:
                         mode      = "draw"
                         col_bgra  = COLORS[color_idx][1]
                         thickness = SIZES[size_idx]
                         sx, sy    = smooth_point(ix, iy)
+
                         if prev_x is not None:
-                            cv2.line(canvas, (prev_x, prev_y), (sx, sy),
-                                     col_bgra, thickness * 2)
-                            cv2.line(canvas, (prev_x, prev_y), (sx, sy),
-                                     col_bgra, max(1, thickness - 1))
+                            # Jika jarak terlalu jauh = jari pindah tiba-tiba
+                            # jangan sambungkan, mulai garis baru
+                            jump_dist = dist_pts(prev_x, prev_y, sx, sy)
+                            if jump_dist > 50:
+                                prev_x, prev_y = sx, sy
+                                smooth_x.clear()
+                                smooth_y.clear()
+                                # Mulai shape baru
+                                shapes.append({
+                                    "type": "line",
+                                    "color": col_bgra,
+                                    "thickness": thickness,
+                                    "data": [(sx, sy)]
+                                })
+                            else:
+                                # Interpolasi normal
+                                d     = dist_pts(prev_x, prev_y, sx, sy)
+                                steps = max(1, d // 2)
+                                for s in range(steps + 1):
+                                    t  = s / steps
+                                    mx = int(prev_x + (sx - prev_x) * t)
+                                    my = int(prev_y + (sy - prev_y) * t)
+                                    cv2.circle(canvas, (mx, my),
+                                               thickness, col_bgra, -1)
+
+                                if not shapes or shapes[-1]["type"] != "line" or \
+                                   shapes[-1]["color"] != col_bgra:
+                                    shapes.append({
+                                        "type": "line",
+                                        "color": col_bgra,
+                                        "thickness": thickness,
+                                        "data": []
+                                    })
+                                shapes[-1]["data"].append((sx, sy))
+
+                        else:
+                            # Pertama kali — mulai shape baru
+                            shapes.append({
+                                "type": "line",
+                                "color": col_bgra,
+                                "thickness": thickness,
+                                "data": [(sx, sy)]
+                            })
+
+                        prev_x, prev_y = sx, sy
+
+                        # Tambah titik ke shape line aktif
+                        if not shapes or shapes[-1]["type"] != "line" or \
+                           shapes[-1]["color"] != col_bgra:
+                            shapes.append({
+                                "type": "line",
+                                "color": col_bgra,
+                                "thickness": thickness,
+                                "data": []
+                            })
+                        shapes[-1]["data"].append((sx, sy))
                         prev_x, prev_y = sx, sy
                         cv2.circle(frame, (sx, sy), thickness+4, col_bgra[:3], -1)
                         cv2.circle(frame, (sx, sy), thickness+6, (255,255,255), 1)
@@ -578,7 +817,9 @@ with HandLandmarker.create_from_options(options) as landmarker:
         # ── Blend canvas + glow ───────────────────────────
         canvas_bgr = canvas[:, :, :3]
         alpha      = canvas[:, :, 3:4].astype(float) / 255.0
-        display    = frame.copy()
+
+        # Koreksi warna minimal — hanya brightness sedikit
+        display = cv2.convertScaleAbs(frame, alpha=1.1, beta=5)
 
         has_drawing = np.any(canvas[:, :, 3] > 0)
         if has_drawing:
@@ -588,6 +829,7 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     display.astype(float) + glow.astype(float) * 0.8,
                     0, 255
                 ).astype(np.uint8)
+            # Blend canvas langsung tanpa LUT
             mask          = alpha[:, :, 0] > 0
             display[mask] = canvas_bgr[mask]
 
