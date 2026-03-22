@@ -10,7 +10,6 @@ import mediapipe as mp
 import cv2
 import numpy as np
 import time
-import threading
 
 # ── Load Model ────────────────────────────────────────────
 model_path = hf_hub_download("Bingsu/adetailer", "hand_yolov8n.pt")
@@ -86,7 +85,7 @@ MIN_SHAPE_SIZE    = 20
 two_finger_rect_start  = 0
 TWO_FINGER_HOLD        = 1.5
 two_finger_active      = False
-two_finger_committed   = False  # sudah di-commit, tunggu tangan dilepas
+two_finger_committed   = False
 two_finger_p1          = None
 two_finger_p2          = None
 TIPS_CLOSE             = 60
@@ -98,28 +97,14 @@ hand_pos_history = []
 hand_is_stable   = False
 
 # Smoothing
-SMOOTH_N = 2
+SMOOTH_N = 1
 smooth_x = []
 smooth_y = []
 
-# Threading untuk MediaPipe
-latest_detection = None
-detection_lock   = threading.Lock()
-
-def detection_thread(landmarker):
-    global latest_detection
-    while cap.isOpened():
-        ret, f = cap.read()
-        if not ret:
-            break
-        f            = cv2.flip(f, 1)
-        small        = cv2.resize(f, (640, 360))
-        rgb          = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-        mp_image     = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        timestamp_ms = int(time.time() * 1000)
-        result       = landmarker.detect_for_video(mp_image, timestamp_ms)
-        with detection_lock:
-            latest_detection = result
+# Frame skip — proses MediaPipe setiap N frame
+PROCESS_EVERY = 3
+frame_count   = 0
+last_detection = None
 
 def smooth_point(x, y):
     smooth_x.append(x)
@@ -299,12 +284,10 @@ def draw_hud(display, now):
     else:
         mode_str = "idle"
 
-    stable_str = " | stable" if hand_is_stable else ""
-    cv2.putText(display, f"{name}  |  {mode_str}{stable_str}",
+    cv2.putText(display, f"{name}  |  {mode_str}",
                 (46, 30), cv2.FONT_HERSHEY_SIMPLEX,
                 0.55, (255, 255, 255), 1)
 
-    # Fist progress bar
     if fist_start_time > 0 and not fist_triggered:
         elapsed  = now - fist_start_time
         progress = min(elapsed / 1.0, 1.0)
@@ -315,7 +298,6 @@ def draw_hud(display, now):
                     (20, H-32), cv2.FONT_HERSHEY_SIMPLEX,
                     0.4, (160,160,255), 1)
 
-    # Pinky progress bar
     if pinky_start_time > 0 and not pinky_triggered:
         elapsed  = now - pinky_start_time
         progress = min(elapsed / L_HOLD, 1.0)
@@ -327,8 +309,7 @@ def draw_hud(display, now):
                     (20, H-56), cv2.FONT_HERSHEY_SIMPLEX,
                     0.4, (220,220,160), 1)
 
-    # Two finger rect progress bar
-    if two_finger_active:
+    if two_finger_active and not two_finger_committed:
         elapsed  = now - two_finger_rect_start
         progress = min(elapsed / TWO_FINGER_HOLD, 1.0)
         bar_w    = int(200 * progress)
@@ -350,22 +331,11 @@ def draw_notif(display, text):
     cv2.putText(display, text, (x, y), font, 1.0, (255,255,255), 2)
 
 print("Hand Board — Q: quit | S: save")
-print("☝  1 jari            = draw")
-print("☝☝ 2 telunjuk tahan  = rectangle")
-print("👌 pose OK            = circle")
-print("kelingking            = next color")
-print("3 jari rapat          = eraser")
-print("kepalan tahan 1s      = clear")
 
 cv2.namedWindow("Hand Board", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("Hand Board", 1280, 720)
 
 with HandLandmarker.create_from_options(options) as landmarker:
-    # Jalankan deteksi di thread terpisah
-    t = threading.Thread(target=detection_thread,
-                         args=(landmarker,), daemon=True)
-    t.start()
-
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -374,62 +344,62 @@ with HandLandmarker.create_from_options(options) as landmarker:
         frame = cv2.flip(frame, 1)
         H, W  = frame.shape[:2]
         now   = time.time()
+        frame_count += 1
 
-        with detection_lock:
-            detection = latest_detection
+        # Koreksi warna agar lebih vivid seperti ffplay
+        frame = cv2.convertScaleAbs(frame, alpha=1.2, beta=10)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        frame[:, :, 1] = cv2.convertScaleAbs(frame[:, :, 1], alpha=1.5)
+        frame = cv2.cvtColor(frame, cv2.COLOR_HSV2BGR)
 
-        if detection is None:
-            cv2.imshow("Hand Board", frame)
-            cv2.waitKey(1)
-            continue
+        # Proses MediaPipe setiap N frame — kurangi beban CPU
+        if frame_count % PROCESS_EVERY == 0:
+            small        = cv2.resize(frame, (640, 360))
+            rgb          = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            mp_image     = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp_ms = int(time.time() * 1000)
+            last_detection = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-        hand_count  = len(detection.hand_landmarks)
-        index_tips  = []   # tangan dengan 1 telunjuk (untuk rect)
-        single_hands = []  # semua tangan (untuk draw & gesture)
+        detection  = last_detection
+        hand_count = len(detection.hand_landmarks) if detection else 0
 
-        for hand_lm in detection.hand_landmarks:
-            lm = hand_lm
-            up = fingers_up(lm)
-            tip_x = int(lm[8].x * W)
-            tip_y = int(lm[8].y * H)
+        index_tips   = []
+        single_hands = []
 
-            # Semua tangan masuk single_hands
-            single_hands.append((lm, up))
-
-            # Juga masuk index_tips jika hanya telunjuk terangkat
-            if up[1] and not up[2] and not up[3] and not up[4]:
-                index_tips.append((tip_x, tip_y, lm, up))
+        if detection:
+            for hand_lm in detection.hand_landmarks:
+                lm    = hand_lm
+                up    = fingers_up(lm)
+                tip_x = int(lm[8].x * W)
+                tip_y = int(lm[8].y * H)
+                single_hands.append((lm, up))
+                if up[1] and not up[2] and not up[3] and not up[4]:
+                    index_tips.append((tip_x, tip_y, lm, up))
 
         # ── Mode 2 telunjuk = rectangle ───────────────────
         if len(index_tips) == 2:
-            p1 = (index_tips[0][0], index_tips[0][1])
-            p2 = (index_tips[1][0], index_tips[1][1])
+            p1        = (index_tips[0][0], index_tips[0][1])
+            p2        = (index_tips[1][0], index_tips[1][1])
             tips_dist = dist_pts(p1[0], p1[1], p2[0], p2[1])
 
             if two_finger_committed:
-                # Sudah commit — tunggu tangan dipisah dulu
-                # agar tidak commit lagi
                 if tips_dist > TIPS_CLOSE * 2:
                     two_finger_committed = False
                     two_finger_active    = False
 
             elif not two_finger_active:
                 if tips_dist < TIPS_CLOSE:
-                    # Rapat — mulai mode rect
                     two_finger_rect_start = now
                     two_finger_active     = True
                     two_finger_p1         = p1
                     two_finger_p2         = p2
                 else:
-                    # Belum rapat — hint
                     cv2.line(frame, p1, p2, (100,100,100), 1)
                     cv2.putText(frame, f"bring closer: {tips_dist}px",
                                 (p1[0], p1[1]-15),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.5, (150,150,150), 1)
-
             else:
-                # Aktif — update posisi & preview
                 two_finger_p1 = p1
                 two_finger_p2 = p2
                 held          = now - two_finger_rect_start
@@ -440,14 +410,12 @@ with HandLandmarker.create_from_options(options) as landmarker:
                 cv2.circle(frame, p1, 8, col, -1)
                 cv2.circle(frame, p2, 8, col, -1)
 
-                # Commit hanya sekali setelah tahan cukup
                 if held >= TWO_FINGER_HOLD and not two_finger_committed:
                     ok = commit_rect(p1, p2)
                     if ok:
                         set_notif("Rectangle drawn!")
                     two_finger_committed = True
 
-            # Reset state lain saat 2 tangan aktif
             prev_x, prev_y   = None, None
             fist_start_time  = 0
             fist_triggered   = False
@@ -458,13 +426,18 @@ with HandLandmarker.create_from_options(options) as landmarker:
             mode             = "idle"
 
         else:
-            # Kurang dari 2 telunjuk — reset semua rect state
+            if two_finger_active and not two_finger_committed:
+                if two_finger_p1 and two_finger_p2:
+                    held = now - two_finger_rect_start
+                    if held >= TWO_FINGER_HOLD:
+                        ok = commit_rect(two_finger_p1, two_finger_p2)
+                        if ok:
+                            set_notif("Rectangle drawn!")
             two_finger_active    = False
             two_finger_committed = False
             two_finger_p1        = None
             two_finger_p2        = None
 
-            # ── Reset saat tidak ada tangan ───────────────
             if hand_count == 0:
                 hand_pos_history.clear()
                 hand_is_stable   = False
@@ -479,19 +452,12 @@ with HandLandmarker.create_from_options(options) as landmarker:
                 smooth_y.clear()
                 mode = "idle"
 
-            # ── Proses setiap tangan ──────────────────────
             for lm, up in single_hands:
                 ix = int(lm[8].x * W)
                 iy = int(lm[8].y * H)
                 ax, ay = get_shape_anchor(lm)
-
                 update_stability(lm)
 
-                # DEBUG
-                #pinch = dist(lm, 4, 8)
-                #print(f"up={up} pinch={pinch:.3f} circle={is_circle_gesture(lm,up)} stable={hand_is_stable}")
-
-                # ── Fist: clear canvas ────────────────────
                 if is_fist(lm):
                     shape_mode     = None
                     shape_start    = None
@@ -499,21 +465,17 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     prev_x, prev_y = None, None
                     pinky_start_time = 0
                     pinky_triggered  = False
-
                     if fist_start_time == 0:
                         fist_start_time = now
                         fist_triggered  = False
-
                     if now - fist_start_time >= 1.0 and not fist_triggered:
                         canvas         = np.zeros((H, W, 4), dtype=np.uint8)
                         fist_triggered = True
                         set_notif("Canvas cleared")
-
                     kx = int(lm[9].x * W)
                     ky = int(lm[9].y * H)
                     cv2.circle(frame, (kx, ky), 30, (0,80,255), 2)
 
-                # ── 3 fingers: eraser ─────────────────────
                 elif is_three_fingers(lm):
                     shape_mode     = None
                     shape_start    = None
@@ -523,7 +485,6 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     fist_triggered   = False
                     pinky_start_time = 0
                     pinky_triggered  = False
-
                     tips_x = [lm[8].x, lm[12].x, lm[16].x]
                     tips_y = [lm[8].y, lm[12].y, lm[16].y]
                     cx_e   = int(sum(tips_x) / 3 * W)
@@ -532,7 +493,6 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     cv2.circle(frame,  (cx_e, cy_e), 40, (255,255,255), 2)
                     cv2.circle(frame,  (cx_e, cy_e), 3,  (255,255,255), -1)
 
-                # ── Pinky only: next color ─────────────────
                 elif is_pinky_only(lm):
                     shape_mode     = None
                     shape_start    = None
@@ -540,23 +500,19 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     prev_x, prev_y = None, None
                     fist_start_time = 0
                     fist_triggered  = False
-
                     if pinky_start_time == 0:
                         pinky_start_time = now
                         pinky_triggered  = False
-
                     if now - pinky_start_time >= L_HOLD and not pinky_triggered:
                         color_idx       = (color_idx + 1) % len(COLORS)
                         pinky_triggered = True
                         set_notif(COLORS[color_idx][0])
-
                     px = int(lm[20].x * W)
                     py = int(lm[20].y * H)
                     nc = COLORS[(color_idx + 1) % len(COLORS)][1][:3]
                     cv2.circle(frame, (px, py), 10, nc, -1)
                     cv2.circle(frame, (px, py), 12, (255,255,255), 1)
 
-                # ── Circle gesture ────────────────────────
                 elif is_circle_gesture(lm, up):
                     fist_start_time  = 0
                     fist_triggered   = False
@@ -564,7 +520,6 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     pinky_triggered  = False
                     prev_x, prev_y   = None, None
                     mode = "idle"
-
                     if shape_mode != "circle":
                         if shape_mode is not None and shape_start is not None:
                             if now - shape_start_time >= SHAPE_MIN_HOLD:
@@ -574,18 +529,15 @@ with HandLandmarker.create_from_options(options) as landmarker:
                         shape_mode       = "circle"
                         shape_start      = (ax, ay)
                         shape_start_time = now
-
                     if now - shape_start_time >= SHAPE_MIN_HOLD and shape_start:
                         col = COLORS[color_idx][1][:3]
                         t   = SIZES[size_idx]
                         r   = dist_pts(shape_start[0], shape_start[1], ax, ay)
                         cv2.circle(frame, shape_start, r, col, t)
                         cv2.circle(frame, shape_start, 6, (255,255,255), 2)
-
                     cv2.circle(frame, (ax, ay), 8, COLORS[color_idx][1][:3], -1)
 
                 else:
-                    # Gesture circle dilepas — commit
                     if shape_mode is not None and shape_start is not None:
                         if now - shape_start_time >= SHAPE_MIN_HOLD:
                             if now - shape_last_commit >= SHAPE_DEBOUNCE:
@@ -595,30 +547,25 @@ with HandLandmarker.create_from_options(options) as landmarker:
                                     set_notif("Circle drawn!")
                     shape_mode  = None
                     shape_start = None
-
                     fist_start_time  = 0
                     fist_triggered   = False
                     pinky_start_time = 0
                     pinky_triggered  = False
 
-                    # ── 1 finger: draw ────────────────────
                     if up[1] and not up[2] and not up[3] and not up[4]:
                         mode      = "draw"
                         col_bgra  = COLORS[color_idx][1]
                         thickness = SIZES[size_idx]
                         sx, sy    = smooth_point(ix, iy)
-
                         if prev_x is not None:
                             cv2.line(canvas, (prev_x, prev_y), (sx, sy),
                                      col_bgra, thickness * 2)
                             cv2.line(canvas, (prev_x, prev_y), (sx, sy),
                                      col_bgra, max(1, thickness - 1))
-
                         prev_x, prev_y = sx, sy
                         cv2.circle(frame, (sx, sy), thickness+4, col_bgra[:3], -1)
                         cv2.circle(frame, (sx, sy), thickness+6, (255,255,255), 1)
 
-                    # ── 2+ fingers: lift pen ──────────────
                     elif up[1] and up[2]:
                         mode           = "idle"
                         prev_x, prev_y = None, None
@@ -628,26 +575,21 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     else:
                         prev_x, prev_y = None, None
 
-        # ── Blend canvas + glow onto camera feed ──────────
+        # ── Blend canvas + glow ───────────────────────────
         canvas_bgr = canvas[:, :, :3]
         alpha      = canvas[:, :, 3:4].astype(float) / 255.0
         display    = frame.copy()
 
         has_drawing = np.any(canvas[:, :, 3] > 0)
-        if has_drawing and mode == "draw":
-            # Hanya hitung glow saat aktif menggambar
-            glow    = apply_glow(canvas, COLORS[color_idx][1])
-            display = np.clip(
-                display.astype(float) + glow.astype(float) * 0.8,
-                0, 255
-            ).astype(np.uint8)
-        elif has_drawing:
-            # Saat idle — blend canvas saja tanpa glow
+        if has_drawing:
+            if mode == "draw":
+                glow    = apply_glow(canvas, COLORS[color_idx][1])
+                display = np.clip(
+                    display.astype(float) + glow.astype(float) * 0.8,
+                    0, 255
+                ).astype(np.uint8)
             mask          = alpha[:, :, 0] > 0
             display[mask] = canvas_bgr[mask]
-
-        mask          = alpha[:, :, 0] > 0
-        display[mask] = canvas_bgr[mask]
 
         draw_hud(display, now)
 
