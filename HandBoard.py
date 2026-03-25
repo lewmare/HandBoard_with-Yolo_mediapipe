@@ -11,6 +11,7 @@ import mediapipe as mp
 import cv2
 import numpy as np
 import time
+import threading
 
 # ── Load Model ────────────────────────────────────────────
 model_path = hf_hub_download("Bingsu/adetailer", "hand_yolov8n.pt")
@@ -26,14 +27,14 @@ options = HandLandmarkerOptions(
     running_mode=VisionRunningMode.VIDEO,
     num_hands=2,
     min_hand_detection_confidence=0.3,
-    min_tracking_confidence=0.3
+    min_tracking_confidence=0.2
 )
 
 # ── Camera ────────────────────────────────────────────────
-cap = cv2.VideoCapture(3)
+cap = cv2.VideoCapture(2)
 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1296)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 972)
 cap.set(cv2.CAP_PROP_FPS, 30)
 cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
 cap.set(cv2.CAP_PROP_FOCUS, 0)
@@ -49,24 +50,29 @@ canvas = np.zeros((H, W, 4), dtype=np.uint8)
 
 # ── Colors ────────────────────────────────────────────────
 COLORS = [
+    ("White",  (255, 255, 255, 255)),
+    ("Black",  (0,   0,   0,   255)),
     ("Red",    (0,   0,   255, 255)),
     ("Orange", (0,   140, 255, 255)),
     ("Yellow", (0,   220, 255, 255)),
     ("Green",  (0,   220, 0,   255)),
     ("Blue",   (255, 80,  0,   255)),
     ("Purple", (220, 0,   220, 255)),
-    ("White",  (255, 255, 255, 255)),
-    ("Black",  (0,   0,   0,   255)),
 ]
 color_idx = 0
 SIZES     = [2, 4, 8, 16]
 size_idx  = 1
 
+# ── Helper dists (needed before shape functions) ──────────
+def dist_pts(x1, y1, x2, y2):
+    return int(((x2-x1)**2 + (y2-y1)**2) ** 0.5)
+
 # ── Shape objects ─────────────────────────────────────────
-shapes = []
+shapes       = []
+canvas_dirty = False
 
 def redraw_canvas():
-    global canvas
+    global canvas, canvas_dirty
     canvas = np.zeros((H, W, 4), dtype=np.uint8)
     for s in shapes:
         col = s["color"]
@@ -89,13 +95,25 @@ def redraw_canvas():
                     mx  = int(p1[0] + (p2[0] - p1[0]) * t_i)
                     my  = int(p1[1] + (p2[1] - p1[1]) * t_i)
                     cv2.circle(canvas, (mx, my), t, col, -1)
+    canvas_dirty = True
 
 def point_near_shape(px, py, s, threshold=40):
     if s["type"] == "rect":
         x1, y1, x2, y2 = s["data"]
-        inside    = x1 <= px <= x2 and y1 <= py <= y2
-        near_edge = (abs(px-x1) < threshold or abs(px-x2) < threshold or
-                     abs(py-y1) < threshold or abs(py-y2) < threshold)
+
+         # Pastikan urutan benar
+        x1, x2 = min(x1, x2), max(x1, x2)
+        y1, y2 = min(y1, y2), max(y1, y2)
+
+        inside = (x1 <= px <= x2 and y1 <= py <= y2)
+
+        on_left = abs(px - x1) < threshold and y1 <= py <= y2
+        on_right = abs(px - x2) < threshold and y1 <= py <= y2
+        on_top = abs(py - y1) < threshold and x1 <= px <= x2
+        on_bottom = abs(py - y2) < threshold and x1 <= px <= x2
+
+        near_edge = on_left or on_right or on_top or on_bottom
+
         return inside or near_edge
     elif s["type"] == "circle":
         cx, cy, r = s["data"]
@@ -118,6 +136,63 @@ def move_shape(idx, dx, dy):
     elif s["type"] == "line":
         s["data"] = [(x+dx, y+dy) for x,y in s["data"]]
 
+# ── Glow (low-res + threaded) ─────────────────────────────
+glow_cache       = None
+glow_lock        = threading.Lock()
+glow_thread_busy = False
+
+def apply_glow_multicolor(shapes_list, radius=8):
+    """Hitung glow di resolusi kecil (25%) lalu scale up"""
+    scale  = 0.25
+    sh     = int(H * scale)
+    sw     = int(W * scale)
+    glow_s = np.zeros((sh, sw, 3), dtype=np.float32)
+    r_s    = max(1, int(radius * scale))
+
+    for s in shapes_list:
+        col = np.array(s["color"][:3], dtype=np.float32)
+        tmp = np.zeros((sh, sw, 4), dtype=np.uint8)
+        t   = max(1, int(s["thickness"] * scale))
+
+        if s["type"] == "rect":
+            x1, y1, x2, y2 = s["data"]
+            cv2.rectangle(tmp,
+                          (int(x1*scale), int(y1*scale)),
+                          (int(x2*scale), int(y2*scale)),
+                          s["color"], t)
+        elif s["type"] == "circle":
+            cx, cy, r = s["data"]
+            cv2.circle(tmp,
+                       (int(cx*scale), int(cy*scale)),
+                       max(1, int(r*scale)),
+                       s["color"], t)
+        elif s["type"] == "line":
+            pts = s["data"]
+            for j in range(1, len(pts)):
+                p1 = (int(pts[j-1][0]*scale), int(pts[j-1][1]*scale))
+                p2 = (int(pts[j][0]*scale),   int(pts[j][1]*scale))
+                cv2.line(tmp, p1, p2, s["color"], t)
+
+        mask = (tmp[:, :, 3] > 0).astype(np.uint8) * 255
+        for r_val, strength in [(r_s, 0.5), (max(1, r_s//3), 0.4)]:
+            b = cv2.GaussianBlur(mask.astype(np.float32), (0,0), r_val)
+            b = b[:, :, np.newaxis] / 255.0
+            glow_s += b * col * strength
+
+    glow_full = cv2.resize(
+        np.clip(glow_s, 0, 255).astype(np.uint8),
+        (W, H),
+        interpolation=cv2.INTER_LINEAR
+    )
+    return glow_full
+
+def compute_glow_async(shapes_snapshot):
+    global glow_cache, glow_thread_busy
+    result = apply_glow_multicolor(shapes_snapshot)
+    with glow_lock:
+        glow_cache = result
+    glow_thread_busy = False
+
 # ── State ─────────────────────────────────────────────────
 prev_x, prev_y       = None, None
 mode                 = "idle"
@@ -129,7 +204,6 @@ pinky_start_time     = 0
 pinky_triggered      = False
 L_HOLD               = 0.6
 
-# Shape state
 shape_start       = None
 shape_mode        = None
 shape_start_time  = 0
@@ -137,10 +211,10 @@ shape_last_commit = 0
 SHAPE_MIN_HOLD    = 0.3
 SHAPE_DEBOUNCE    = 0.5
 MIN_SHAPE_SIZE    = 20
-DRAW_COOLDOWN     = 0.8
 last_shape_time   = 0
+last_erase_time   = 0
+DRAW_COOLDOWN     = 0.8
 
-# Two finger rect
 two_finger_rect_start  = 0
 TWO_FINGER_HOLD        = 1.5
 two_finger_active      = False
@@ -149,29 +223,24 @@ two_finger_p1          = None
 two_finger_p2          = None
 TIPS_CLOSE             = 60
 
-# Drag/move
 drag_active   = False
 drag_idx      = -1
 drag_prev_x   = None
 drag_prev_y   = None
 
-# Stabilitas
 STABLE_FRAMES    = 10
 STABLE_THRESHOLD = 0.015
 hand_pos_history = []
 hand_is_stable   = False
 
-# Smoothing
 SMOOTH_N = 2
 smooth_x = []
 smooth_y = []
 
-# Frame processing
 PROCESS_EVERY  = 1
 frame_count    = 0
 last_detection = None
 
-# Gesture stability
 gesture_history = []
 GESTURE_FRAMES  = 3
 
@@ -183,7 +252,6 @@ def stable_gesture(gesture):
         return gesture
     return Counter(gesture_history).most_common(1)[0][0]
 
-# ── Helper functions ──────────────────────────────────────
 def smooth_point(x, y):
     smooth_x.append(x)
     smooth_y.append(y)
@@ -197,9 +265,6 @@ def dist(lm, a, b):
     dx = lm[a].x - lm[b].x
     dy = lm[a].y - lm[b].y
     return (dx**2 + dy**2) ** 0.5
-
-def dist_pts(x1, y1, x2, y2):
-    return int(((x2-x1)**2 + (y2-y1)**2) ** 0.5)
 
 def hand_facing_down(lm):
     if len(lm) < 21:
@@ -286,6 +351,19 @@ def is_three_fingers(lm):
 def is_four_fingers(up):
     return (not up[0] and up[1] and up[2] and up[3] and up[4])
 
+def is_two_finger(lm):
+    if len(lm) < 21:
+        return False
+    index_len  = dist(lm, 8,  5)
+    middle_len = dist(lm, 12, 9)
+    ring_len   = dist(lm, 16, 13)
+    pinky_len  = dist(lm, 20, 17)
+    if index_len < 0.12 or middle_len < 0.12:
+        return False
+    if ring_len > 0.12 or pinky_len > 0.12:
+        return False
+    return True
+
 def is_circle_gesture(lm, up):
     if len(lm) < 21:
         return False
@@ -311,12 +389,10 @@ def commit_rect(p1, p2):
     global last_shape_time
     if abs(p2[0]-p1[0]) < MIN_SHAPE_SIZE or abs(p2[1]-p1[1]) < MIN_SHAPE_SIZE:
         return False
-    col       = COLORS[color_idx][1]
-    thickness = SIZES[size_idx]
     shapes.append({
         "type": "rect",
-        "color": col,
-        "thickness": thickness,
+        "color": COLORS[color_idx][1],
+        "thickness": SIZES[size_idx],
         "data": (p1[0], p1[1], p2[0], p2[1])
     })
     redraw_canvas()
@@ -328,31 +404,16 @@ def commit_circle(sx, sy, cx, cy):
     r = dist_pts(sx, sy, cx, cy)
     if r < MIN_SHAPE_SIZE:
         return False
-    col       = COLORS[color_idx][1]
-    thickness = SIZES[size_idx]
     shapes.append({
         "type": "circle",
-        "color": col,
-        "thickness": thickness,
+        "color": COLORS[color_idx][1],
+        "thickness": SIZES[size_idx],
         "data": (sx, sy, r)
     })
     redraw_canvas()
     shape_last_commit = time.time()
     last_shape_time   = time.time()
     return True
-
-def apply_glow(canvas, color_bgra, radius=12):
-    alpha = canvas[:, :, 3]
-    mask  = (alpha > 0).astype(np.uint8) * 255
-    col   = np.array(color_bgra[:3], dtype=np.float32)
-    glow  = np.zeros((*mask.shape, 3), dtype=np.float32)
-    for r, strength in [(radius, 0.5), (radius // 3, 0.4)]:
-        if r < 1:
-            r = 1
-        b = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), r)
-        b = b[:, :, np.newaxis] / 255.0
-        glow += b * col * strength
-    return np.clip(glow, 0, 255).astype(np.uint8)
 
 def set_notif(text):
     global notification_text, notification_time
@@ -363,7 +424,6 @@ def draw_hud(display, now):
     name, bgra = COLORS[color_idx]
     cv2.circle(display, (24, 24), 14, bgra[:3], -1)
     cv2.circle(display, (24, 24), 14, (255, 255, 255), 1)
-
     if two_finger_active:
         mode_str = "rectangle"
     elif shape_mode == "circle":
@@ -374,10 +434,8 @@ def draw_hud(display, now):
         mode_str = "moving"
     else:
         mode_str = "idle"
-
     cv2.putText(display, f"{name}  |  {mode_str}",
-                (46, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                0.55, (255, 255, 255), 1)
+                (46, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
 
     if fist_start_time > 0 and not fist_triggered:
         elapsed  = now - fist_start_time
@@ -386,8 +444,7 @@ def draw_hud(display, now):
         cv2.rectangle(display, (20, H-28), (220, H-14), (50,50,50), -1)
         cv2.rectangle(display, (20, H-28), (20+bar_w, H-14), (60,60,220), -1)
         cv2.putText(display, "Hold to clear",
-                    (20, H-32), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4, (160,160,255), 1)
+                    (20, H-32), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160,160,255), 1)
 
     if pinky_start_time > 0 and not pinky_triggered:
         elapsed  = now - pinky_start_time
@@ -397,8 +454,7 @@ def draw_hud(display, now):
         cv2.rectangle(display, (20, H-52), (220, H-38), (50,50,50), -1)
         cv2.rectangle(display, (20, H-52), (20+bar_w, H-38), next_col[1][:3], -1)
         cv2.putText(display, f"Next: {next_col[0]}",
-                    (20, H-56), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4, (220,220,160), 1)
+                    (20, H-56), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (220,220,160), 1)
 
     if two_finger_active and not two_finger_committed:
         elapsed  = now - two_finger_rect_start
@@ -408,8 +464,7 @@ def draw_hud(display, now):
         cv2.rectangle(display, (20, H-76), (220, H-62), (50,50,50), -1)
         cv2.rectangle(display, (20, H-76), (20+bar_w, H-62), col, -1)
         cv2.putText(display, "Hold to draw rect...",
-                    (20, H-80), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4, (220,220,100), 1)
+                    (20, H-80), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (220,220,100), 1)
 
 def draw_notif(display, text):
     if not text:
@@ -422,12 +477,11 @@ def draw_notif(display, text):
     cv2.putText(display, text, (x, y), font, 1.0, (255,255,255), 2)
 
 print("Hand Board — Q: quit | S: save")
-
 cv2.namedWindow("Hand Board", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Hand Board", 1280, 720)
+cv2.resizeWindow("Hand Board", 1296, 972)
 
 with HandLandmarker.create_from_options(options) as landmarker:
-    while cap.isOpened():
+    while cap.isOpened():       
         ret, frame = cap.read()
         if not ret:
             break
@@ -480,8 +534,7 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     cv2.line(frame, p1, p2, (100,100,100), 1)
                     cv2.putText(frame, f"bring closer: {tips_dist}px",
                                 (p1[0], p1[1]-15),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5, (150,150,150), 1)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,150,150), 1)
             else:
                 two_finger_p1 = p1
                 two_finger_p2 = p2
@@ -544,7 +597,6 @@ with HandLandmarker.create_from_options(options) as landmarker:
                 ax, ay = get_shape_anchor(lm)
                 update_stability(lm)
 
-                # Tentukan gesture saat ini
                 if is_fist(lm):
                     current_gesture = "fist"
                 elif is_three_fingers(lm):
@@ -557,14 +609,13 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     current_gesture = "circle"
                 elif up[1] and not up[2] and not up[3] and not up[4]:
                     current_gesture = "draw"
-                elif up[1] and up[2]:
+                elif up[1] and up[2] or is_two_finger(lm):
                     current_gesture = "lift"
                 else:
                     current_gesture = "idle"
 
                 current_gesture = stable_gesture(current_gesture)
 
-                # ── Fist: clear canvas ────────────────────
                 if current_gesture == "fist":
                     shape_mode     = None
                     shape_start    = None
@@ -578,13 +629,14 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     if now - fist_start_time >= 1.0 and not fist_triggered:
                         canvas = np.zeros((H, W, 4), dtype=np.uint8)
                         shapes.clear()
+                        with glow_lock:
+                            glow_cache = None
                         fist_triggered = True
                         set_notif("Canvas cleared")
                     kx = int(lm[9].x * W)
                     ky = int(lm[9].y * H)
                     cv2.circle(frame, (kx, ky), 30, (0,80,255), 2)
 
-                # ── 3 fingers: eraser ─────────────────────
                 elif current_gesture == "three":
                     shape_mode     = None
                     shape_start    = None
@@ -624,13 +676,16 @@ with HandLandmarker.create_from_options(options) as landmarker:
 
                     if need_redraw:
                         redraw_canvas()
+                        with glow_lock:
+                            glow_cache = None
                     else:
-                        cv2.circle(canvas, (cx_e, cy_e), eraser_r, (0,0,0,0), -1)
+                        need_redraw = True
+                        canvas_dirty = True
 
+                    last_erase_time = time.time()
                     cv2.circle(frame, (cx_e, cy_e), eraser_r, (255,255,255), 2)
                     cv2.circle(frame, (cx_e, cy_e), 3,        (255,255,255), -1)
 
-                # ── Pinky: next color ──────────────────────
                 elif current_gesture == "pinky":
                     shape_mode     = None
                     shape_start    = None
@@ -651,7 +706,6 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     cv2.circle(frame, (px, py), 10, nc, -1)
                     cv2.circle(frame, (px, py), 12, (255,255,255), 1)
 
-                # ── 4 jari: move shape ────────────────────
                 elif current_gesture == "four":
                     fist_start_time  = 0
                     fist_triggered   = False
@@ -677,24 +731,29 @@ with HandLandmarker.create_from_options(options) as landmarker:
                                 break
 
                     if drag_active and drag_idx >= 0:
-                        if drag_prev_x is not None:
-                            dx = mx - drag_prev_x
-                            dy = my - drag_prev_y
-                            move_shape(drag_idx, dx, dy)
-                            redraw_canvas()
-                        drag_prev_x = mx
-                        drag_prev_y = my
-                        s = shapes[drag_idx]
-                        if s["type"] == "rect":
-                            x1,y1,x2,y2 = s["data"]
-                            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,255), 2)
-                        elif s["type"] == "circle":
-                            cx,cy,r = s["data"]
-                            cv2.circle(frame, (cx,cy), r, (0,255,255), 2)
+                        if drag_idx >= len(shapes):
+                            drag_active = False
+                            drag_idx    = -1
+                            drag_prev_x = None
+                            drag_prev_y = None
+                        else:
+                            if drag_prev_x is not None:
+                                dx = mx - drag_prev_x
+                                dy = my - drag_prev_y
+                                move_shape(drag_idx, dx, dy)
+                                redraw_canvas()
+                            drag_prev_x = mx
+                            drag_prev_y = my
+                            s = shapes[drag_idx]
+                            if s["type"] == "rect":
+                                x1,y1,x2,y2 = s["data"]
+                                cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,255), 2)
+                            elif s["type"] == "circle":
+                                cx,cy,r = s["data"]
+                                cv2.circle(frame, (cx,cy), r, (0,255,255), 2)
 
                     cv2.circle(frame, (mx, my), 12, (0,255,255), 2)
 
-                # ── Circle gesture ────────────────────────
                 elif current_gesture == "circle":
                     fist_start_time  = 0
                     fist_triggered   = False
@@ -720,7 +779,6 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     cv2.circle(frame, (ax, ay), 8, COLORS[color_idx][1][:3], -1)
 
                 else:
-                    # Reset drag saat gesture dilepas
                     if drag_active:
                         drag_active = False
                         drag_idx    = -1
@@ -741,9 +799,9 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     pinky_start_time = 0
                     pinky_triggered  = False
 
-                    # ── Draw ──────────────────────────────
                     if current_gesture == "draw" and \
-                       now - last_shape_time > DRAW_COOLDOWN:
+                       now - last_shape_time > DRAW_COOLDOWN and \
+                       now - last_erase_time > DRAW_COOLDOWN:
                         mode      = "draw"
                         col_bgra  = COLORS[color_idx][1]
                         thickness = SIZES[size_idx]
@@ -770,6 +828,7 @@ with HandLandmarker.create_from_options(options) as landmarker:
                                     my  = int(prev_y + (sy - prev_y) * t_i)
                                     cv2.circle(canvas, (mx, my),
                                                thickness, col_bgra, -1)
+                                canvas_dirty = True
                                 if not shapes or shapes[-1]["type"] != "line" or \
                                    shapes[-1]["color"] != col_bgra:
                                     shapes.append({
@@ -803,17 +862,28 @@ with HandLandmarker.create_from_options(options) as landmarker:
         # ── Blend canvas + glow ───────────────────────────
         canvas_bgr = canvas[:, :, :3]
         alpha      = canvas[:, :, 3:4].astype(float) / 255.0
-
-        display = cv2.convertScaleAbs(frame, alpha=1.1, beta=5)
+        display    = cv2.convertScaleAbs(frame, alpha=1.1, beta=5)
 
         has_drawing = np.any(canvas[:, :, 3] > 0)
         if has_drawing:
-            if mode == "draw":
-                glow    = apply_glow(canvas, COLORS[color_idx][1])
-                display = np.clip(
-                    display.astype(float) + glow.astype(float) * 0.8,
-                    0, 255
-                ).astype(np.uint8)
+            # Glow hanya saat idle/move — skip saat draw
+            if mode != "draw" and shapes:
+                if canvas_dirty and not glow_thread_busy:
+                    glow_thread_busy = True
+                    canvas_dirty     = False
+                    t_glow = threading.Thread(
+                        target=compute_glow_async,
+                        args=(list(shapes),),
+                        daemon=True
+                    )
+                    t_glow.start()
+                with glow_lock:
+                    if glow_cache is not None:
+                        display = np.clip(
+                            display.astype(float) + glow_cache.astype(float) * 0.8,
+                            0, 255
+                        ).astype(np.uint8)
+
             mask          = alpha[:, :, 0] > 0
             display[mask] = canvas_bgr[mask]
 
